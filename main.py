@@ -10,7 +10,11 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.core import AstrBotConfig
 from astrbot.core.star.star_tools import StarTools
-from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.core.utils.session_waiter import (
+    SessionController,
+    SessionFilter,
+    session_waiter,
+)
 
 from .qzone import QZoneAPI, QZoneAPIError, SessionExpiredError
 
@@ -38,6 +42,14 @@ class Contribution:
 
 
 # ── 工具函数 ──────────────────────────────────────────────────
+
+
+class SchoolZoneSessionFilter(SessionFilter):
+    """Use group id in groups, otherwise fall back to unified origin."""
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        group_id = event.get_group_id()
+        return group_id if group_id else event.unified_msg_origin
 
 
 def get_image_urls(event: AstrMessageEvent) -> list[str]:
@@ -224,7 +236,7 @@ class SchoolZonePlugin(Star):
             if text in ("完成", "/完成"):
                 if contrib.is_empty:
                     await _send_text(event, "投稿内容为空，请先发送文本或图片")
-                    controller.keep(timeout=timeout)
+                    controller.keep(timeout=timeout, reset_timeout=True)
                     return
 
                 preview = contrib.merged_text or "(无文字)"
@@ -240,7 +252,7 @@ class SchoolZonePlugin(Star):
                     f"{img_hint}确认发布请发送「确认」，取消请发送「取消」",
                 )
                 awaiting_confirm = True
-                controller.keep(timeout=60)
+                controller.keep(timeout=60, reset_timeout=True)
                 return
 
             # --- 确认/取消发布 ---
@@ -255,7 +267,7 @@ class SchoolZonePlugin(Star):
                     return
                 else:
                     await _send_text(event, "请发送「确认」或「取消」")
-                    controller.keep(timeout=60)
+                    controller.keep(timeout=60, reset_timeout=True)
                     return
 
             # --- 未知命令兜底：取消当前投稿并重新分发 ---
@@ -271,12 +283,14 @@ class SchoolZonePlugin(Star):
                 contrib.texts.append(text)
             images = get_image_urls(event)
             contrib.images.extend(images)
-            controller.keep(timeout=timeout)
+            controller.keep(timeout=timeout, reset_timeout=True)
 
         try:
-            await waiter(event)
+            await waiter(event, session_filter=SchoolZoneSessionFilter())
         except TimeoutError:
             yield event.plain_result("投稿超时，已取消")
+        finally:
+            event.stop_event()
 
     # ── LLM Tool ─────────────────────────────────────────────
 
