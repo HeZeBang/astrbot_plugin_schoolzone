@@ -1,3 +1,4 @@
+import copy
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -249,6 +250,15 @@ class SchoolZonePlugin(Star):
                     await _send_text(event, "请发送「确认」或「取消」")
                     controller.keep(timeout=60)
                     return
+
+            # --- 未知命令兜底：取消当前投稿并重新分发 ---
+            raw_text = event.message_obj.message_str.strip()
+            if raw_text.startswith("/"):
+                await _send_text(event, "当前投稿已取消，正在处理新命令...")
+                controller.stop()
+                new_event = copy.copy(event)
+                self.context.get_event_queue().put_nowait(new_event)
+                return
 
             # --- 收集文本和图片 ---
             if text:
