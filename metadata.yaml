@@ -1,6 +1,6 @@
 name: astrbot_plugin_schoolzone
 display_name: 校园表白墙
 desc: 校园表白墙投稿插件，支持文本+图片投稿到QQ空间
-version: v0.1.0
+version: v0.1.1
 author: zambar
 repo: https://github.com/zambar/astrbot_plugin_schoolzone

@@ -70,7 +70,13 @@ async def download_images_to_temp(
 
 async def _send_text(event: AstrMessageEvent, text: str):
     """在 session_waiter 内部发送文本消息"""
-    await event.send(event.plain_result(text))
+    try:
+        chain = Comp.Plain(text)
+        from astrbot.core.message.message_event_result import MessageChain
+        await event.send(MessageChain(chain=[chain]))
+        logger.debug(f"[SchoolZone] _send_text 成功: {text[:30]}")
+    except Exception as e:
+        logger.error(f"[SchoolZone] _send_text 失败: {e}")
 
 
 # ── 插件主体 ──────────────────────────────────────────────────
@@ -205,7 +211,8 @@ class SchoolZonePlugin(Star):
         ):
             nonlocal awaiting_confirm
             text = event.message_str.strip()
-            logger.debug(f"[SchoolZone] waiter 收到: {text}")
+            raw_text = event.message_obj.message_str.strip()
+            logger.debug(f"[SchoolZone] waiter 收到: text={text}, raw={raw_text}")
 
             # --- 取消 ---
             if text in ("取消", "/取消"):
@@ -252,7 +259,6 @@ class SchoolZonePlugin(Star):
                     return
 
             # --- 未知命令兜底：取消当前投稿并重新分发 ---
-            raw_text = event.message_obj.message_str.strip()
             if raw_text.startswith("/"):
                 await _send_text(event, "当前投稿已取消，正在处理新命令...")
                 controller.stop()
