@@ -69,9 +69,7 @@ async def download_images_to_temp(
 
 async def _send_text(event: AstrMessageEvent, text: str):
     """在 session_waiter 内部发送文本消息"""
-    result = event.make_result()
-    result.chain = [Comp.Plain(text)]
-    await event.send(result)
+    await event.send(event.plain_result(text))
 
 
 # ── 插件主体 ──────────────────────────────────────────────────
@@ -225,9 +223,7 @@ class SchoolZonePlugin(Star):
                 await _send_text(event, f"--- 投稿预览 ---\n{preview}")
 
                 for img_url in contrib.images:
-                    img_result = event.make_result()
-                    img_result.chain = [Comp.Image.fromURL(img_url)]
-                    await event.send(img_result)
+                    await event.send(event.image_result(img_url))
 
                 n_img = len(contrib.images)
                 img_hint = f"共 {n_img} 张图片\n" if n_img else ""
