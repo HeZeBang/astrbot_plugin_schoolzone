@@ -1,0 +1,21 @@
+{
+    "cookies_str": {
+        "description": "QQ空间 Cookies",
+        "type": "text",
+        "hint": "完整的 cookie 字符串（需包含 p_skey 和 p_uin），留空则自动从 aiocqhttp 客户端获取",
+        "default": ""
+    },
+    "show_name": {
+        "description": "发布时显示投稿者署名",
+        "type": "bool",
+        "hint": "发布说说时在头部显示「来自 xxx 的投稿」，匿名投稿显示为「匿名者」",
+        "default": true
+    },
+    "contribute_timeout": {
+        "description": "投稿会话超时(秒)",
+        "type": "int",
+        "hint": "用户开始投稿后，多久不操作自动取消",
+        "slider": { "min": 60, "max": 600, "step": 30 },
+        "default": 300
+    }
+}
