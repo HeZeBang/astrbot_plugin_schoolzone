@@ -69,7 +69,9 @@ async def download_images_to_temp(
 
 async def _send_text(event: AstrMessageEvent, text: str):
     """在 session_waiter 内部发送文本消息"""
-    await event.send(event.chain_result([Comp.Plain(text)]))
+    result = event.make_result()
+    result.chain = [Comp.Plain(text)]
+    await event.send(result)
 
 
 # ── 插件主体 ──────────────────────────────────────────────────
@@ -157,10 +159,7 @@ class SchoolZonePlugin(Star):
             await _send_text(event, f"发布失败: {e}")
         finally:
             for f in self.cache_dir.glob("img_*"):
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+                f.unlink(missing_ok=True)
 
     # ── 投稿命令 ─────────────────────────────────────────────
 
@@ -210,13 +209,13 @@ class SchoolZonePlugin(Star):
             logger.debug(f"[SchoolZone] waiter 收到: {text}")
 
             # --- 取消 ---
-            if text == "/取消":
+            if text in ("取消", "/取消"):
                 await _send_text(event, "已取消投稿")
                 controller.stop()
                 return
 
             # --- 完成 → 预览 ---
-            if text == "/完成":
+            if text in ("完成", "/完成"):
                 if contrib.is_empty:
                     await _send_text(event, "投稿内容为空，请先发送文本或图片")
                     controller.keep(timeout=timeout)
@@ -226,9 +225,9 @@ class SchoolZonePlugin(Star):
                 await _send_text(event, f"--- 投稿预览 ---\n{preview}")
 
                 for img_url in contrib.images:
-                    await event.send(
-                        event.chain_result([Comp.Image.fromURL(img_url)])
-                    )
+                    img_result = event.make_result()
+                    img_result.chain = [Comp.Image.fromURL(img_url)]
+                    await event.send(img_result)
 
                 n_img = len(contrib.images)
                 img_hint = f"共 {n_img} 张图片\n" if n_img else ""
@@ -256,7 +255,7 @@ class SchoolZonePlugin(Star):
                     return
 
             # --- 收集文本和图片 ---
-            if text and not text.startswith("/"):
+            if text:
                 contrib.texts.append(text)
             images = get_image_urls(event)
             contrib.images.extend(images)
