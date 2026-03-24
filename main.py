@@ -67,6 +67,11 @@ async def download_images_to_temp(
     return paths
 
 
+async def _send_text(event: AstrMessageEvent, text: str):
+    """在 session_waiter 内部发送文本消息"""
+    await event.send(event.chain_result([Comp.Plain(text)]))
+
+
 # ── 插件主体 ──────────────────────────────────────────────────
 
 
@@ -136,7 +141,7 @@ class SchoolZonePlugin(Star):
         self, event: AstrMessageEvent, contrib: Contribution
     ):
         """下载图片 → 上传 → 发布说说"""
-        await event.send(event.plain_result("正在发布到QQ空间..."))
+        await _send_text(event, "正在发布到QQ空间...")
         try:
             await self._ensure_qzone_ready(event)
 
@@ -157,10 +162,10 @@ class SchoolZonePlugin(Star):
 
             # 发布
             await self.qzone.publish_mood(pub_text, images=uploaded_images)
-            await event.send(event.plain_result("发布成功!"))
+            await _send_text(event, "发布成功!")
         except Exception as e:
             logger.error(f"发布失败: {e}")
-            await event.send(event.plain_result(f"发布失败: {e}"))
+            await _send_text(event, f"发布失败: {e}")
         finally:
             # 清理临时文件
             for f in self.cache_dir.glob("img_*"):
@@ -207,24 +212,20 @@ class SchoolZonePlugin(Star):
 
             # --- 取消 ---
             if text == "/取消":
-                await event.send(event.plain_result("已取消投稿"))
+                await _send_text(event, "已取消投稿")
                 controller.stop()
                 return
 
             # --- 完成 → 预览 ---
             if text == "/完成":
                 if contrib.is_empty:
-                    await event.send(
-                        event.plain_result("投稿内容为空，请先发送文本或图片")
-                    )
+                    await _send_text(event, "投稿内容为空，请先发送文本或图片")
                     controller.keep(timeout=timeout)
                     return
 
                 # 发送文本预览
                 preview = contrib.merged_text or "(无文字)"
-                await event.send(
-                    event.plain_result(f"--- 投稿预览 ---\n{preview}")
-                )
+                await _send_text(event, f"--- 投稿预览 ---\n{preview}")
 
                 # 发送图片预览
                 for img_url in contrib.images:
@@ -233,11 +234,10 @@ class SchoolZonePlugin(Star):
                     )
 
                 n_img = len(contrib.images)
-                img_hint = f"\n共 {n_img} 张图片" if n_img else ""
-                await event.send(
-                    event.plain_result(
-                        f"{img_hint}\n确认发布请发送「确认」，取消请发送「取消」"
-                    )
+                img_hint = f"共 {n_img} 张图片\n" if n_img else ""
+                await _send_text(
+                    event,
+                    f"{img_hint}确认发布请发送「确认」，取消请发送「取消」",
                 )
                 awaiting_confirm = True
                 controller.keep(timeout=60)
@@ -250,13 +250,11 @@ class SchoolZonePlugin(Star):
                     controller.stop()
                     return
                 elif text in ("取消", "否"):
-                    await event.send(event.plain_result("已取消发布"))
+                    await _send_text(event, "已取消发布")
                     controller.stop()
                     return
                 else:
-                    await event.send(
-                        event.plain_result("请发送「确认」或「取消」")
-                    )
+                    await _send_text(event, "请发送「确认」或「取消」")
                     controller.keep(timeout=60)
                     return
 
