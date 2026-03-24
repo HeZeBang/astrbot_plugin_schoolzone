@@ -90,12 +90,12 @@ class SchoolZonePlugin(Star):
         self.contribute_timeout: int = config.get("contribute_timeout", 300)
 
         self.qzone = QZoneAPI(self.cookies_str or None)
-        self.bot = None  # CQHttp 客户端，首次消息时捕获
         self.cache_dir = StarTools.get_data_dir("astrbot_plugin_schoolzone") / "cache"
 
     async def initialize(self):
         """插件加载"""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("SchoolZone 插件已加载")
 
     async def terminate(self):
         """插件卸载"""
@@ -106,14 +106,7 @@ class SchoolZonePlugin(Star):
             except Exception as e:
                 logger.error(f"清理缓存失败: {e}")
 
-    # ── Cookie / 客户端管理 ───────────────────────────────────
-
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    async def _capture_bot(self, event: AstrMessageEvent):
-        """捕获 CQHttp 客户端实例"""
-        if self.bot is None:
-            self.bot = event.bot
-            logger.debug("CQHttp 客户端已捕获")
+    # ── Cookie 管理 ──────────────────────────────────────────
 
     async def _ensure_qzone_ready(self, event: AstrMessageEvent):
         """确保 QZone API 可用（cookie 已设置）"""
@@ -122,8 +115,7 @@ class SchoolZonePlugin(Star):
 
         cookie_str = self.cookies_str
         if not cookie_str:
-            # 尝试从 CQHttp 客户端获取
-            bot = getattr(event, "bot", None) or self.bot
+            bot = getattr(event, "bot", None)
             if bot is None:
                 raise RuntimeError("CQHttp 客户端未初始化，无法获取 Cookie")
             result = await bot.get_cookies(domain="h5.qzone.qq.com")
@@ -145,13 +137,11 @@ class SchoolZonePlugin(Star):
         try:
             await self._ensure_qzone_ready(event)
 
-            # 构建发布文本
             pub_text = contrib.merged_text
             if self.show_name:
                 name = "匿名者" if contrib.anon else contrib.name
                 pub_text = f"【来自 {name} 的投稿】\n\n{pub_text}"
 
-            # 处理图片
             uploaded_images = None
             if contrib.images:
                 paths = await download_images_to_temp(
@@ -160,14 +150,12 @@ class SchoolZonePlugin(Star):
                 if paths:
                     uploaded_images = await self.qzone.upload_images(paths)
 
-            # 发布
             await self.qzone.publish_mood(pub_text, images=uploaded_images)
             await _send_text(event, "发布成功!")
         except Exception as e:
             logger.error(f"发布失败: {e}")
             await _send_text(event, f"发布失败: {e}")
         finally:
-            # 清理临时文件
             for f in self.cache_dir.glob("img_*"):
                 try:
                     f.unlink()
@@ -179,27 +167,37 @@ class SchoolZonePlugin(Star):
     @filter.command("投稿")
     async def cmd_contribute(self, event: AstrMessageEvent):
         """投稿文本/图片到QQ空间"""
-        async for msg in self._do_contribute(event, anon=False):
+        logger.info("[SchoolZone] 收到 /投稿 命令")
+        contrib = Contribution(
+            uin=event.get_sender_id(),
+            name=event.get_sender_name(),
+            anon=False,
+        )
+        yield event.plain_result(
+            "开始投稿，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
+        )
+        async for msg in self._collect_and_publish(event, contrib):
             yield msg
 
     @filter.command("匿名投稿")
     async def cmd_anon_contribute(self, event: AstrMessageEvent):
         """匿名投稿文本/图片到QQ空间"""
-        async for msg in self._do_contribute(event, anon=True):
-            yield msg
-
-    async def _do_contribute(self, event: AstrMessageEvent, anon: bool):
+        logger.info("[SchoolZone] 收到 /匿名投稿 命令")
         contrib = Contribution(
             uin=event.get_sender_id(),
             name=event.get_sender_name(),
-            anon=anon,
+            anon=True,
         )
-
-        label = "匿名投稿" if anon else "投稿"
         yield event.plain_result(
-            f"开始{label}，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
+            "开始匿名投稿，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
         )
+        async for msg in self._collect_and_publish(event, contrib):
+            yield msg
 
+    async def _collect_and_publish(
+        self, event: AstrMessageEvent, contrib: Contribution
+    ):
+        """会话控制：收集投稿内容 → 预览 → 确认发布"""
         awaiting_confirm = False
         timeout = self.contribute_timeout
 
@@ -209,6 +207,7 @@ class SchoolZonePlugin(Star):
         ):
             nonlocal awaiting_confirm
             text = event.message_str.strip()
+            logger.debug(f"[SchoolZone] waiter 收到: {text}")
 
             # --- 取消 ---
             if text == "/取消":
@@ -223,11 +222,9 @@ class SchoolZonePlugin(Star):
                     controller.keep(timeout=timeout)
                     return
 
-                # 发送文本预览
                 preview = contrib.merged_text or "(无文字)"
                 await _send_text(event, f"--- 投稿预览 ---\n{preview}")
 
-                # 发送图片预览
                 for img_url in contrib.images:
                     await event.send(
                         event.chain_result([Comp.Image.fromURL(img_url)])
