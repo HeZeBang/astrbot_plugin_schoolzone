@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
+import typst
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -28,6 +29,7 @@ class Contribution:
     anon: bool = False
     texts: list[str] = field(default_factory=list)
     images: list[str] = field(default_factory=list)
+    local_images: list[str] = field(default_factory=list)
     awaiting_confirm: bool = False
 
     @property
@@ -51,6 +53,19 @@ def get_image_urls(event: AstrMessageEvent) -> list[str]:
     ]
 
 
+def _detect_image_ext(data: bytes) -> str:
+    """根据文件头检测图片格式"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:2] == b"\xff\xd8":
+        return ".jpg"
+    if data[:4] == b"GIF8":
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".jpg"
+
+
 async def download_images_to_temp(
     urls: list[str], cache_dir: Path
 ) -> list[str]:
@@ -62,12 +77,49 @@ async def download_images_to_temp(
             try:
                 async with session.get(url) as resp:
                     data = await resp.read()
-                    path = cache_dir / f"img_{i}.jpg"
+                    ext = _detect_image_ext(data)
+                    path = cache_dir / f"img_{i}{ext}"
                     path.write_bytes(data)
                     paths.append(str(path))
             except Exception as e:
                 logger.error(f"下载图片失败: {url} - {e}")
     return paths
+
+
+_PLUGIN_DIR = Path(__file__).parent
+_FONT_DIR = str(_PLUGIN_DIR / "fonts")
+_TEMPLATE_PATH = _PLUGIN_DIR / "template" / "preview.typ"
+
+
+def render_preview(
+    contrib: "Contribution",
+    show_name: bool,
+    work_dir: Path,
+) -> bytes:
+    """用 Typst 渲染投稿预览（含嵌入图片），返回 PNG 字节"""
+    # 将模板复制到工作目录，使其与图片在同一 root 下
+    template_dst = work_dir / "preview.typ"
+    shutil.copy2(_TEMPLATE_PATH, template_dst)
+
+    author = ""
+    if show_name:
+        author = "匿名者" if contrib.anon else contrib.name
+
+    # 图片文件名列表（相对于 work_dir）
+    img_files = ",".join(Path(p).name for p in contrib.local_images)
+
+    return typst.compile(
+        str(template_dst),
+        root=str(work_dir),
+        sys_inputs={
+            "author": author,
+            "content": contrib.merged_text or "",
+            "img_files": img_files,
+        },
+        font_paths=[_FONT_DIR],
+        format="png",
+        ppi=144,
+    )
 
 
 # ── 插件主体 ──────────────────────────────────────────────────
@@ -209,19 +261,22 @@ class SchoolZonePlugin(Star):
         uploaded_images = None
         if contrib.images:
             try:
-                paths = await download_images_to_temp(
+                # 优先复用预览时已下载的本地图片
+                paths = contrib.local_images or await download_images_to_temp(
                     contrib.images, self.cache_dir
                 )
                 if paths:
                     uploaded_images = await self.qzone.upload_images(paths)
             except Exception as e:
                 logger.error(f"图片上传失败: {e}")
+                self._cleanup_cache()
                 return f"发布失败（图片上传出错）: {e}"
 
         last_error: Exception | None = None
         for attempt in range(1, MAX_PUBLISH_RETRIES + 1):
             try:
                 await self.qzone.publish_mood(pub_text, images=uploaded_images)
+                self._cleanup_cache()
                 return "发布成功!"
             except SessionExpiredError as e:
                 last_error = e
@@ -243,11 +298,22 @@ class SchoolZonePlugin(Star):
         )
         logger.error(error_msg)
         await self._notify_admin(event, error_msg)
-
-        for f in self.cache_dir.glob("img_*"):
-            f.unlink(missing_ok=True)
+        self._cleanup_cache()
 
         return f"发布失败，已通知管理员。错误: {last_error}"
+
+    def _cleanup_cache(self):
+        """清理缓存目录内容"""
+        if not self.cache_dir.exists():
+            return
+        for item in self.cache_dir.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            except Exception:
+                pass
 
     # ── 投稿命令 ─────────────────────────────────────────────
 
@@ -308,14 +374,31 @@ class SchoolZonePlugin(Star):
             if contrib.is_empty:
                 yield event.plain_result("投稿内容为空，请先发送文本或图片。")
             else:
-                preview = contrib.merged_text or "(无文字)"
-                n_img = len(contrib.images)
-                img_hint = f"\n共 {n_img} 张图片" if n_img else ""
                 contrib.awaiting_confirm = True
-                yield event.plain_result(
-                    f"--- 投稿预览 ---\n{preview}{img_hint}"
-                    "\n\n确认发布请发送 /确认，取消请发送 /取消"
-                )
+                try:
+                    # 为本次预览创建工作目录，下载图片供 Typst 嵌入
+                    sid_safe = session_id.replace(":", "_").replace("/", "_")
+                    work_dir = self.cache_dir / sid_safe
+                    work_dir.mkdir(parents=True, exist_ok=True)
+
+                    if contrib.images:
+                        contrib.local_images = await download_images_to_temp(
+                            contrib.images, work_dir
+                        )
+
+                    png_data = render_preview(contrib, self.show_name, work_dir)
+                    preview_path = work_dir / "preview.png"
+                    preview_path.write_bytes(png_data)
+                    yield event.image_result(str(preview_path))
+                except Exception as e:
+                    logger.warning(f"Typst 渲染预览失败，回退到纯文本: {e}")
+                    preview = contrib.merged_text or "(无文字)"
+                    n_img = len(contrib.images)
+                    img_hint = f"\n共 {n_img} 张图片" if n_img else ""
+                    yield event.plain_result(
+                        f"--- 投稿预览 ---\n{preview}{img_hint}"
+                        "\n\n确认发布请发送 /确认，取消请发送 /取消"
+                    )
             event.stop_event()
             return
 
