@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,14 @@ MAX_PUBLISH_RETRIES = 3
 
 
 @dataclass
+class ContentItem:
+    """单条投稿内容（保持用户发送顺序）"""
+
+    type: str  # "text" | "image"
+    content: str  # 文本内容 或 图片 URL
+
+
+@dataclass
 class Contribution:
     """投稿收集（仅存在于会话中，不持久化）"""
 
@@ -30,7 +39,9 @@ class Contribution:
     texts: list[str] = field(default_factory=list)
     images: list[str] = field(default_factory=list)
     local_images: list[str] = field(default_factory=list)
+    items: list[ContentItem] = field(default_factory=list)
     awaiting_confirm: bool = False
+    mode: str = "post"  # "post" | "dialog"
 
     @property
     def merged_text(self) -> str:
@@ -88,31 +99,31 @@ async def download_images_to_temp(
 
 _PLUGIN_DIR = Path(__file__).parent
 _FONT_DIR = str(_PLUGIN_DIR / "fonts")
-_TEMPLATE_PATH = _PLUGIN_DIR / "template" / "preview.typ"
+_TEMPLATE_DIR = _PLUGIN_DIR / "template"
 
 
-def render_preview(
+def _get_author(contrib: "Contribution", show_name: bool) -> str:
+    if not show_name:
+        return ""
+    return "匿名者" if contrib.anon else contrib.name
+
+
+def render_post(
     contrib: "Contribution",
     show_name: bool,
     work_dir: Path,
 ) -> bytes:
-    """用 Typst 渲染投稿预览（含嵌入图片），返回 PNG 字节"""
-    # 将模板复制到工作目录，使其与图片在同一 root 下
+    """帖子模式：用 preview.typ 渲染预览卡片"""
     template_dst = work_dir / "preview.typ"
-    shutil.copy2(_TEMPLATE_PATH, template_dst)
+    shutil.copy2(_TEMPLATE_DIR / "preview.typ", template_dst)
 
-    author = ""
-    if show_name:
-        author = "匿名者" if contrib.anon else contrib.name
-
-    # 图片文件名列表（相对于 work_dir）
     img_files = ",".join(Path(p).name for p in contrib.local_images)
 
     return typst.compile(
         str(template_dst),
         root=str(work_dir),
         sys_inputs={
-            "author": author,
+            "author": _get_author(contrib, show_name),
             "content": contrib.merged_text or "",
             "img_files": img_files,
         },
@@ -120,6 +131,79 @@ def render_preview(
         format="png",
         ppi=144,
     )
+
+
+def _build_dialog_json(contrib: "Contribution", work_dir: Path) -> Path:
+    """根据投稿内容生成 dialog.typ 所需的 JSON 文件"""
+    # 构建有序 content 列表，图片路径映射到本地文件
+    img_url_to_local: dict[str, str] = {}
+    for url, local in zip(contrib.images, contrib.local_images):
+        img_url_to_local[url] = f"./{Path(local).name}"
+
+    content: list[dict] = []
+    for item in contrib.items:
+        if item.type == "text":
+            content.append({"type": "text", "content": item.content})
+        elif item.type == "image" and item.content in img_url_to_local:
+            content.append({"type": "image", "content": img_url_to_local[item.content]})
+
+    avatar_file = next(work_dir.glob("avatar.*"), None)
+    avatar_rel = f"./{avatar_file.name}" if avatar_file else "./avatar.png"
+
+    data = {
+        "name": contrib.name,
+        "avatar": avatar_rel,
+        "is_anon": contrib.anon,
+        "content": content,
+    }
+
+    json_path = work_dir / "data.json"
+    json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return json_path
+
+
+def render_dialog(
+    contrib: "Contribution",
+    work_dir: Path,
+) -> bytes:
+    """对话模式：用 dialog.typ 渲染聊天记录截图"""
+    # 复制 dialog 模板 + ourchat 库到工作目录
+    template_dst = work_dir / "dialog.typ"
+    shutil.copy2(_TEMPLATE_DIR / "dialog.typ", template_dst)
+    ourchat_dst = work_dir / "ourchat"
+    if not ourchat_dst.exists():
+        shutil.copytree(_TEMPLATE_DIR / "ourchat", ourchat_dst)
+
+    json_path = _build_dialog_json(contrib, work_dir)
+
+    return typst.compile(
+        str(template_dst),
+        root=str(work_dir),
+        sys_inputs={"json": f"./{json_path.name}"},
+        font_paths=[_FONT_DIR],
+        format="png",
+        ppi=144,
+    )
+
+
+async def download_avatar(uin: str, work_dir: Path) -> str:
+    """下载 QQ 头像到工作目录，返回本地路径"""
+    url = f"https://q1.qlogo.cn/g?b=qq&nk={uin}&s=640"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url) as resp:
+                data = await resp.read()
+                ext = _detect_image_ext(data)
+                path = work_dir / f"avatar{ext}"
+                path.write_bytes(data)
+                return str(path)
+        except Exception as e:
+            logger.warning(f"下载头像失败: {e}")
+            # 使用占位头像
+            placeholder = _TEMPLATE_DIR / "placeholder.png"
+            dst = work_dir / "avatar.png"
+            shutil.copy2(placeholder, dst)
+            return str(dst)
 
 
 # ── 插件主体 ──────────────────────────────────────────────────
@@ -244,7 +328,8 @@ class SchoolZonePlugin(Star):
     # ── 发布逻辑（含重试） ───────────────────────────────────
 
     async def _do_publish(
-        self, event: AstrMessageEvent, contrib: Contribution
+        self, event: AstrMessageEvent, contrib: Contribution,
+        session_id: str = "",
     ) -> str:
         """下载图片 → 上传 → 发布说说，最多重试 3 次，仍失败则通知管理员"""
         try:
@@ -253,24 +338,39 @@ class SchoolZonePlugin(Star):
             logger.error(f"QZone 初始化失败: {e}")
             return f"发布失败: {e}"
 
-        pub_text = contrib.merged_text
-        if self.show_name:
-            name = "匿名者" if contrib.anon else contrib.name
-            pub_text = f"【来自 {name} 的投稿】\n\n{pub_text}"
+        name = "匿名者" if contrib.anon else contrib.name
 
-        uploaded_images = None
-        if contrib.images:
+        if contrib.mode == "dialog":
+            # 对话模式：正文只有署名，图片为渲染出的对话截图
+            pub_text = f"【来自 {name} 的投稿】" if self.show_name else ""
             try:
-                # 优先复用预览时已下载的本地图片
-                paths = contrib.local_images or await download_images_to_temp(
-                    contrib.images, self.cache_dir
-                )
-                if paths:
-                    uploaded_images = await self.qzone.upload_images(paths)
+                work_dir = self._get_work_dir(session_id) if session_id else self.cache_dir
+                dialog_png = self._render_current_mode(contrib, work_dir)
+                dialog_path = work_dir / "dialog_publish.png"
+                dialog_path.write_bytes(dialog_png)
+                uploaded_images = await self.qzone.upload_images([str(dialog_path)])
             except Exception as e:
-                logger.error(f"图片上传失败: {e}")
+                logger.error(f"对话模式渲染/上传失败: {e}")
                 self._cleanup_cache()
-                return f"发布失败（图片上传出错）: {e}"
+                return f"发布失败（对话图片生成出错）: {e}"
+        else:
+            # 帖子模式：原有逻辑
+            pub_text = contrib.merged_text
+            if self.show_name:
+                pub_text = f"【来自 {name} 的投稿】\n\n{pub_text}"
+
+            uploaded_images = None
+            if contrib.images:
+                try:
+                    paths = contrib.local_images or await download_images_to_temp(
+                        contrib.images, self.cache_dir
+                    )
+                    if paths:
+                        uploaded_images = await self.qzone.upload_images(paths)
+                except Exception as e:
+                    logger.error(f"图片上传失败: {e}")
+                    self._cleanup_cache()
+                    return f"发布失败（图片上传出错）: {e}"
 
         last_error: Exception | None = None
         for attempt in range(1, MAX_PUBLISH_RETRIES + 1):
@@ -315,6 +415,38 @@ class SchoolZonePlugin(Star):
             except Exception:
                 pass
 
+    # ── 渲染辅助 ─────────────────────────────────────────────
+
+    def _get_work_dir(self, session_id: str) -> Path:
+        sid_safe = session_id.replace(":", "_").replace("/", "_")
+        return self.cache_dir / sid_safe
+
+    async def _prepare_work_dir(
+        self, contrib: Contribution, session_id: str
+    ) -> Path:
+        """准备工作目录：下载图片 + 头像"""
+        work_dir = self._get_work_dir(session_id)
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        if contrib.images and not contrib.local_images:
+            contrib.local_images = await download_images_to_temp(
+                contrib.images, work_dir
+            )
+
+        # 预下载头像（对话模式需要，提前准备以便切换时无延迟）
+        if not any(work_dir.glob("avatar.*")):
+            await download_avatar(contrib.uin, work_dir)
+
+        return work_dir
+
+    def _render_current_mode(
+        self, contrib: Contribution, work_dir: Path
+    ) -> bytes:
+        """根据当前模式渲染预览图"""
+        if contrib.mode == "dialog":
+            return render_dialog(contrib, work_dir)
+        return render_post(contrib, self.show_name, work_dir)
+
     # ── 投稿命令 ─────────────────────────────────────────────
 
     @filter.command("投稿")
@@ -331,7 +463,7 @@ class SchoolZonePlugin(Star):
             anon=False,
         )
         yield event.plain_result(
-            "开始投稿，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
+            "开始投稿，请发送文本/图片\n完成: /完成  取消: /取消"
         )
 
     @filter.command("匿名投稿")
@@ -348,7 +480,7 @@ class SchoolZonePlugin(Star):
             anon=True,
         )
         yield event.plain_result(
-            "开始匿名投稿，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
+            "开始匿名投稿，请发送文本/图片\n完成: /完成  取消: /取消"
         )
 
     # ── 全局消息监听：收集投稿内容 + 会话内命令 ─────────────────
@@ -376,20 +508,17 @@ class SchoolZonePlugin(Star):
             else:
                 contrib.awaiting_confirm = True
                 try:
-                    # 为本次预览创建工作目录，下载图片供 Typst 嵌入
-                    sid_safe = session_id.replace(":", "_").replace("/", "_")
-                    work_dir = self.cache_dir / sid_safe
-                    work_dir.mkdir(parents=True, exist_ok=True)
-
-                    if contrib.images:
-                        contrib.local_images = await download_images_to_temp(
-                            contrib.images, work_dir
-                        )
-
-                    png_data = render_preview(contrib, self.show_name, work_dir)
+                    work_dir = await self._prepare_work_dir(contrib, session_id)
+                    png_data = self._render_current_mode(contrib, work_dir)
                     preview_path = work_dir / "preview.png"
                     preview_path.write_bytes(png_data)
                     yield event.image_result(str(preview_path))
+                    mode_hint = "帖子模式" if contrib.mode == "post" else "对话模式"
+                    yield event.plain_result(
+                        f"当前: {mode_hint}\n"
+                        "切换样式: /帖子模式 /对话模式\n"
+                        "确认发布: /确认  取消: /取消"
+                    )
                 except Exception as e:
                     logger.warning(f"Typst 渲染预览失败，回退到纯文本: {e}")
                     preview = contrib.merged_text or "(无文字)"
@@ -397,14 +526,43 @@ class SchoolZonePlugin(Star):
                     img_hint = f"\n共 {n_img} 张图片" if n_img else ""
                     yield event.plain_result(
                         f"--- 投稿预览 ---\n{preview}{img_hint}"
-                        "\n\n确认发布请发送 /确认，取消请发送 /取消"
+                        "\n\n确认发布: /确认  取消: /取消"
                     )
             event.stop_event()
             return
 
         if raw_text == "/取消":
             del self.contrib_sessions[session_id]
+            self._cleanup_cache()
             yield event.plain_result("已取消投稿。")
+            event.stop_event()
+            return
+
+        if raw_text in ("/帖子模式", "/对话模式"):
+            if not contrib.awaiting_confirm:
+                yield event.plain_result("请先发送 /完成 进行预览。")
+            else:
+                new_mode = "post" if raw_text == "/帖子模式" else "dialog"
+                if contrib.mode == new_mode:
+                    yield event.plain_result(
+                        f"已经是{'帖子' if new_mode == 'post' else '对话'}模式了。"
+                    )
+                else:
+                    contrib.mode = new_mode
+                    try:
+                        work_dir = self._get_work_dir(session_id)
+                        png_data = self._render_current_mode(contrib, work_dir)
+                        preview_path = work_dir / "preview.png"
+                        preview_path.write_bytes(png_data)
+                        yield event.image_result(str(preview_path))
+                        mode_hint = "帖子模式" if new_mode == "post" else "对话模式"
+                        yield event.plain_result(
+                            f"已切换到{mode_hint}\n"
+                            "确认发布: /确认  取消: /取消"
+                        )
+                    except Exception as e:
+                        logger.warning(f"切换模式渲染失败: {e}")
+                        yield event.plain_result(f"渲染失败: {e}")
             event.stop_event()
             return
 
@@ -413,7 +571,7 @@ class SchoolZonePlugin(Star):
                 yield event.plain_result("请先发送 /完成 进行预览。")
             else:
                 yield event.plain_result("正在发布到QQ空间...")
-                result_msg = await self._do_publish(event, contrib)
+                result_msg = await self._do_publish(event, contrib, session_id)
                 del self.contrib_sessions[session_id]
                 yield event.plain_result(result_msg)
             event.stop_event()
@@ -432,6 +590,9 @@ class SchoolZonePlugin(Star):
 
         if text:
             contrib.texts.append(text)
+            contrib.items.append(ContentItem("text", text))
+        for url in images:
+            contrib.items.append(ContentItem("image", url))
         contrib.images.extend(images)
 
         parts = []

@@ -11,7 +11,7 @@
 #let img-count = img-files.len()
 
 #set page(width: 400pt, height: auto, margin: 16pt)
-#set text(font: "Noto Sans SC", size: 13pt, fill: rgb("#0f1419"))
+#set text(font: ("Noto Sans SC", "Libertinus Serif"), size: 13pt, fill: rgb("#0f1419"))
 
 #block(
   width: 100%,

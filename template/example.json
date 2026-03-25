@@ -1,0 +1,15 @@
+{
+    "name": "sample",
+    "avatar": "./placeholder.png",
+    "is_anon": false,
+    "content": [
+        {
+            "type": "text",
+            "content": "示例文本"
+        },
+        {
+            "type": "image",
+            "content": "./placeholder.png"
+        }
+    ]
+}
