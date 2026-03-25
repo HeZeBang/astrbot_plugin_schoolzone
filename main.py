@@ -1,3 +1,4 @@
+import asyncio
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,8 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.star.star_tools import StarTools
 
 from .qzone import QZoneAPI, QZoneAPIError, SessionExpiredError
+
+MAX_PUBLISH_RETRIES = 3
 
 
 # ── 数据结构 ──────────────────────────────────────────────────
@@ -82,11 +85,17 @@ class SchoolZonePlugin(Star):
 
         self.cookies_str: str = config.get("cookies_str", "")
         self.show_name: bool = config.get("show_name", True)
+        self.admin_notify_group: str = config.get("admin_notify_group", "")
 
         self.qzone = QZoneAPI(self.cookies_str or None)
         self.cache_dir = StarTools.get_data_dir("astrbot_plugin_schoolzone") / "cache"
 
         self.contrib_sessions: dict[str, Contribution] = {}
+
+        # 管理员 ID 列表（用于失败通知兜底）
+        self._admins_id: list[str] = context.get_config().get("admins_id", [])
+        # bot 客户端引用，延迟获取
+        self._bot = None
 
     async def initialize(self):
         """插件加载"""
@@ -104,6 +113,12 @@ class SchoolZonePlugin(Star):
 
     # ── Cookie 管理 ──────────────────────────────────────────
 
+    def _get_bot(self, event: AstrMessageEvent):
+        """获取并缓存 bot 客户端引用"""
+        if self._bot is None:
+            self._bot = getattr(event, "bot", None)
+        return self._bot
+
     async def _ensure_qzone_ready(self, event: AstrMessageEvent):
         """确保 QZone API 可用（cookie 已设置）"""
         if self.qzone.is_ready:
@@ -111,7 +126,7 @@ class SchoolZonePlugin(Star):
 
         cookie_str = self.cookies_str
         if not cookie_str:
-            bot = getattr(event, "bot", None)
+            bot = self._get_bot(event)
             if bot is None:
                 raise RuntimeError("CQHttp 客户端未初始化，无法获取 Cookie")
             result = await bot.get_cookies(domain="h5.qzone.qq.com")
@@ -123,36 +138,116 @@ class SchoolZonePlugin(Star):
         if not ok:
             raise RuntimeError("Cookie 无效或已过期，请更新")
 
-    # ── 发布逻辑 ─────────────────────────────────────────────
+    async def _refresh_cookie(self, event: AstrMessageEvent) -> bool:
+        """尝试重新获取 cookie 并刷新会话，成功返回 True"""
+        bot = self._get_bot(event)
+        if bot is None:
+            return False
+        try:
+            result = await bot.get_cookies(domain="h5.qzone.qq.com")
+            cookie_str = result.get("cookies", "")
+            if cookie_str:
+                return await self.qzone.update_cookie(cookie_str)
+        except Exception as e:
+            logger.warning(f"刷新 Cookie 失败: {e}")
+        return False
+
+    # ── 管理员通知 ────────────────────────────────────────────
+
+    async def _notify_admin(self, event: AstrMessageEvent, message: str):
+        """发布失败后通知管理员群或管理员私聊"""
+        bot = self._get_bot(event)
+        if bot is None:
+            logger.error(f"无法通知管理员（bot 未初始化）: {message}")
+            return
+
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+        from astrbot.core.message.message_event_result import MessageChain
+
+        chain = [Comp.Plain(message)]
+        obmsg = await AiocqhttpMessageEvent._parse_onebot_json(MessageChain(chain))
+
+        # 优先发送到配置的管理群
+        if self.admin_notify_group and self.admin_notify_group.isdigit():
+            try:
+                await bot.send_group_msg(
+                    group_id=int(self.admin_notify_group), message=obmsg
+                )
+                return
+            except Exception as e:
+                logger.error(f"通知管理群失败: {e}")
+
+        # 兜底：私聊通知 AstrBot 管理员
+        for admin_id in self._admins_id:
+            if admin_id.isdigit():
+                try:
+                    await bot.send_private_msg(
+                        user_id=int(admin_id), message=obmsg
+                    )
+                except Exception as e:
+                    logger.error(f"通知管理员 {admin_id} 失败: {e}")
+
+    # ── 发布逻辑（含重试） ───────────────────────────────────
 
     async def _do_publish(
         self, event: AstrMessageEvent, contrib: Contribution
     ) -> str:
-        """下载图片 → 上传 → 发布说说，返回结果消息"""
+        """下载图片 → 上传 → 发布说说，最多重试 3 次，仍失败则通知管理员"""
         try:
             await self._ensure_qzone_ready(event)
+        except Exception as e:
+            logger.error(f"QZone 初始化失败: {e}")
+            return f"发布失败: {e}"
 
-            pub_text = contrib.merged_text
-            if self.show_name:
-                name = "匿名者" if contrib.anon else contrib.name
-                pub_text = f"【来自 {name} 的投稿】\n\n{pub_text}"
+        pub_text = contrib.merged_text
+        if self.show_name:
+            name = "匿名者" if contrib.anon else contrib.name
+            pub_text = f"【来自 {name} 的投稿】\n\n{pub_text}"
 
-            uploaded_images = None
-            if contrib.images:
+        uploaded_images = None
+        if contrib.images:
+            try:
                 paths = await download_images_to_temp(
                     contrib.images, self.cache_dir
                 )
                 if paths:
                     uploaded_images = await self.qzone.upload_images(paths)
+            except Exception as e:
+                logger.error(f"图片上传失败: {e}")
+                return f"发布失败（图片上传出错）: {e}"
 
-            await self.qzone.publish_mood(pub_text, images=uploaded_images)
-            return "发布成功!"
-        except Exception as e:
-            logger.error(f"发布失败: {e}")
-            return f"发布失败: {e}"
-        finally:
-            for f in self.cache_dir.glob("img_*"):
-                f.unlink(missing_ok=True)
+        last_error: Exception | None = None
+        for attempt in range(1, MAX_PUBLISH_RETRIES + 1):
+            try:
+                await self.qzone.publish_mood(pub_text, images=uploaded_images)
+                return "发布成功!"
+            except SessionExpiredError as e:
+                last_error = e
+                logger.warning(f"发布第 {attempt} 次失败（会话过期）: {e}")
+                if not await self._refresh_cookie(event):
+                    break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"发布第 {attempt} 次失败: {e}")
+                if attempt < MAX_PUBLISH_RETRIES:
+                    await asyncio.sleep(2 * attempt)
+
+        # 所有重试均失败
+        error_msg = (
+            f"[SchoolZone] 投稿发布失败（重试 {MAX_PUBLISH_RETRIES} 次后放弃）\n"
+            f"投稿者: {contrib.name}（{'匿名' if contrib.anon else '署名'}）\n"
+            f"内容: {pub_text[:100]}{'...' if len(pub_text) > 100 else ''}\n"
+            f"错误: {last_error}"
+        )
+        logger.error(error_msg)
+        await self._notify_admin(event, error_msg)
+
+        for f in self.cache_dir.glob("img_*"):
+            f.unlink(missing_ok=True)
+
+        return f"发布失败，已通知管理员。错误: {last_error}"
 
     # ── 投稿命令 ─────────────────────────────────────────────
 
