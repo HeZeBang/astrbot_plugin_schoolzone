@@ -190,73 +190,63 @@ class SchoolZonePlugin(Star):
             "开始匿名投稿，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
         )
 
-    @filter.command("完成")
-    async def cmd_finish(self, event: AstrMessageEvent):
-        """完成投稿，进入预览"""
-        session_id = event.unified_msg_origin
-        if session_id not in self.contrib_sessions:
-            yield event.plain_result("当前没有进行中的投稿。")
-            return
-
-        contrib = self.contrib_sessions[session_id]
-        if contrib.is_empty:
-            yield event.plain_result("投稿内容为空，请先发送文本或图片。")
-            return
-
-        preview = contrib.merged_text or "(无文字)"
-        n_img = len(contrib.images)
-        img_hint = f"\n共 {n_img} 张图片" if n_img else ""
-        contrib.awaiting_confirm = True
-
-        yield event.plain_result(
-            f"--- 投稿预览 ---\n{preview}{img_hint}\n\n确认发布请发送 /确认，取消请发送 /取消"
-        )
-
-    @filter.command("确认")
-    async def cmd_confirm(self, event: AstrMessageEvent):
-        """确认发布投稿"""
-        session_id = event.unified_msg_origin
-        if session_id not in self.contrib_sessions:
-            yield event.plain_result("当前没有进行中的投稿。")
-            return
-
-        contrib = self.contrib_sessions[session_id]
-        if not contrib.awaiting_confirm:
-            yield event.plain_result("请先发送 /完成 进行预览。")
-            return
-
-        yield event.plain_result("正在发布到QQ空间...")
-        result_msg = await self._do_publish(event, contrib)
-        del self.contrib_sessions[session_id]
-        yield event.plain_result(result_msg)
-
-    @filter.command("取消")
-    async def cmd_cancel(self, event: AstrMessageEvent):
-        """取消当前投稿"""
-        session_id = event.unified_msg_origin
-        if session_id not in self.contrib_sessions:
-            yield event.plain_result("当前没有进行中的投稿。")
-            return
-
-        del self.contrib_sessions[session_id]
-        yield event.plain_result("已取消投稿。")
-
-    # ── 全局消息监听：收集投稿内容 ────────────────────────────
+    # ── 全局消息监听：收集投稿内容 + 会话内命令 ─────────────────
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_contribute_message(self, event: AstrMessageEvent):
-        """在投稿进行中时收集用户发送的文本和图片"""
+        """在投稿进行中时：处理 /完成、/取消、/确认，以及收集文本和图片"""
         session_id = event.unified_msg_origin
         if session_id not in self.contrib_sessions:
             return
 
+        # 跳过 /投稿 /匿名投稿 本身（已由命令处理器处理）
+        text = event.message_str.strip()
+        if text in ("投稿", "匿名投稿"):
+            return
+
         contrib = self.contrib_sessions[session_id]
+        raw_text = event.message_obj.message_str.strip()
+
+        # ── 会话内命令（必须以 / 开头） ──
+
+        if raw_text == "/完成":
+            if contrib.is_empty:
+                yield event.plain_result("投稿内容为空，请先发送文本或图片。")
+            else:
+                preview = contrib.merged_text or "(无文字)"
+                n_img = len(contrib.images)
+                img_hint = f"\n共 {n_img} 张图片" if n_img else ""
+                contrib.awaiting_confirm = True
+                yield event.plain_result(
+                    f"--- 投稿预览 ---\n{preview}{img_hint}"
+                    "\n\n确认发布请发送 /确认，取消请发送 /取消"
+                )
+            event.stop_event()
+            return
+
+        if raw_text == "/取消":
+            del self.contrib_sessions[session_id]
+            yield event.plain_result("已取消投稿。")
+            event.stop_event()
+            return
+
+        if raw_text == "/确认":
+            if not contrib.awaiting_confirm:
+                yield event.plain_result("请先发送 /完成 进行预览。")
+            else:
+                yield event.plain_result("正在发布到QQ空间...")
+                result_msg = await self._do_publish(event, contrib)
+                del self.contrib_sessions[session_id]
+                yield event.plain_result(result_msg)
+            event.stop_event()
+            return
 
         # 等待确认阶段，忽略非命令消息
         if contrib.awaiting_confirm:
             return
 
-        text = event.message_str.strip()
+        # ── 收集文本和图片 ──
+
         images = get_image_urls(event)
 
         if not text and not images:
