@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes from commits
+        id: notes
+        run: |
+          # Get previous tag
+          prev_tag=$(git tag --sort=-v:refname | sed -n '2p')
+          if [ -n "$prev_tag" ]; then
+            log=$(git log "$prev_tag"..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          else
+            log=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          # Write to file for gh release
+          echo "$log" > /tmp/release_notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release_notes.md
