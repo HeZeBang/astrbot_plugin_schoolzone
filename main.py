@@ -1,4 +1,3 @@
-import copy
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,11 +9,6 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.core import AstrBotConfig
 from astrbot.core.star.star_tools import StarTools
-from astrbot.core.utils.session_waiter import (
-    SessionController,
-    SessionFilter,
-    session_waiter,
-)
 
 from .qzone import QZoneAPI, QZoneAPIError, SessionExpiredError
 
@@ -24,13 +18,14 @@ from .qzone import QZoneAPI, QZoneAPIError, SessionExpiredError
 
 @dataclass
 class Contribution:
-    """投稿收集（仅存在于会话闭包中，不持久化）"""
+    """投稿收集（仅存在于会话中，不持久化）"""
 
     uin: str
     name: str = ""
     anon: bool = False
     texts: list[str] = field(default_factory=list)
     images: list[str] = field(default_factory=list)
+    awaiting_confirm: bool = False
 
     @property
     def merged_text(self) -> str:
@@ -42,14 +37,6 @@ class Contribution:
 
 
 # ── 工具函数 ──────────────────────────────────────────────────
-
-
-class SchoolZoneSessionFilter(SessionFilter):
-    """Use group id in groups, otherwise fall back to unified origin."""
-
-    def filter(self, event: AstrMessageEvent) -> str:
-        group_id = event.get_group_id()
-        return group_id if group_id else event.unified_msg_origin
 
 
 def get_image_urls(event: AstrMessageEvent) -> list[str]:
@@ -80,17 +67,6 @@ async def download_images_to_temp(
     return paths
 
 
-async def _send_text(event: AstrMessageEvent, text: str):
-    """在 session_waiter 内部发送文本消息"""
-    try:
-        chain = Comp.Plain(text)
-        from astrbot.core.message.message_event_result import MessageChain
-        await event.send(MessageChain(chain=[chain]))
-        logger.debug(f"[SchoolZone] _send_text 成功: {text[:30]}")
-    except Exception as e:
-        logger.error(f"[SchoolZone] _send_text 失败: {e}")
-
-
 # ── 插件主体 ──────────────────────────────────────────────────
 
 
@@ -106,10 +82,11 @@ class SchoolZonePlugin(Star):
 
         self.cookies_str: str = config.get("cookies_str", "")
         self.show_name: bool = config.get("show_name", True)
-        self.contribute_timeout: int = config.get("contribute_timeout", 300)
 
         self.qzone = QZoneAPI(self.cookies_str or None)
         self.cache_dir = StarTools.get_data_dir("astrbot_plugin_schoolzone") / "cache"
+
+        self.contrib_sessions: dict[str, Contribution] = {}
 
     async def initialize(self):
         """插件加载"""
@@ -148,11 +125,10 @@ class SchoolZonePlugin(Star):
 
     # ── 发布逻辑 ─────────────────────────────────────────────
 
-    async def _publish_contribution(
+    async def _do_publish(
         self, event: AstrMessageEvent, contrib: Contribution
-    ):
-        """下载图片 → 上传 → 发布说说"""
-        await _send_text(event, "正在发布到QQ空间...")
+    ) -> str:
+        """下载图片 → 上传 → 发布说说，返回结果消息"""
         try:
             await self._ensure_qzone_ready(event)
 
@@ -170,10 +146,10 @@ class SchoolZonePlugin(Star):
                     uploaded_images = await self.qzone.upload_images(paths)
 
             await self.qzone.publish_mood(pub_text, images=uploaded_images)
-            await _send_text(event, "发布成功!")
+            return "发布成功!"
         except Exception as e:
             logger.error(f"发布失败: {e}")
-            await _send_text(event, f"发布失败: {e}")
+            return f"发布失败: {e}"
         finally:
             for f in self.cache_dir.glob("img_*"):
                 f.unlink(missing_ok=True)
@@ -183,8 +159,12 @@ class SchoolZonePlugin(Star):
     @filter.command("投稿")
     async def cmd_contribute(self, event: AstrMessageEvent):
         """投稿文本/图片到QQ空间"""
-        logger.info("[SchoolZone] 收到 /投稿 命令")
-        contrib = Contribution(
+        session_id = event.unified_msg_origin
+        if session_id in self.contrib_sessions:
+            del self.contrib_sessions[session_id]
+            yield event.plain_result("上一次投稿已取消，开始新投稿。")
+
+        self.contrib_sessions[session_id] = Contribution(
             uin=event.get_sender_id(),
             name=event.get_sender_name(),
             anon=False,
@@ -192,14 +172,16 @@ class SchoolZonePlugin(Star):
         yield event.plain_result(
             "开始投稿，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
         )
-        async for msg in self._collect_and_publish(event, contrib):
-            yield msg
 
     @filter.command("匿名投稿")
     async def cmd_anon_contribute(self, event: AstrMessageEvent):
         """匿名投稿文本/图片到QQ空间"""
-        logger.info("[SchoolZone] 收到 /匿名投稿 命令")
-        contrib = Contribution(
+        session_id = event.unified_msg_origin
+        if session_id in self.contrib_sessions:
+            del self.contrib_sessions[session_id]
+            yield event.plain_result("上一次投稿已取消，开始新匿名投稿。")
+
+        self.contrib_sessions[session_id] = Contribution(
             uin=event.get_sender_id(),
             name=event.get_sender_name(),
             anon=True,
@@ -207,90 +189,92 @@ class SchoolZonePlugin(Star):
         yield event.plain_result(
             "开始匿名投稿，请发送文本/图片，完成请发送 /完成，取消请发送 /取消"
         )
-        async for msg in self._collect_and_publish(event, contrib):
-            yield msg
 
-    async def _collect_and_publish(
-        self, event: AstrMessageEvent, contrib: Contribution
-    ):
-        """会话控制：收集投稿内容 → 预览 → 确认发布"""
-        awaiting_confirm = False
-        timeout = self.contribute_timeout
+    @filter.command("完成")
+    async def cmd_finish(self, event: AstrMessageEvent):
+        """完成投稿，进入预览"""
+        session_id = event.unified_msg_origin
+        if session_id not in self.contrib_sessions:
+            yield event.plain_result("当前没有进行中的投稿。")
+            return
 
-        @session_waiter(timeout=timeout)
-        async def waiter(
-            controller: SessionController, event: AstrMessageEvent
-        ):
-            nonlocal awaiting_confirm
-            text = event.message_str.strip()
-            raw_text = event.message_obj.message_str.strip()
-            logger.debug(f"[SchoolZone] waiter 收到: text={text}, raw={raw_text}")
+        contrib = self.contrib_sessions[session_id]
+        if contrib.is_empty:
+            yield event.plain_result("投稿内容为空，请先发送文本或图片。")
+            return
 
-            # --- 取消 ---
-            if text in ("取消", "/取消"):
-                await _send_text(event, "已取消投稿")
-                controller.stop()
-                return
+        preview = contrib.merged_text or "(无文字)"
+        n_img = len(contrib.images)
+        img_hint = f"\n共 {n_img} 张图片" if n_img else ""
+        contrib.awaiting_confirm = True
 
-            # --- 完成 → 预览 ---
-            if text in ("完成", "/完成"):
-                if contrib.is_empty:
-                    await _send_text(event, "投稿内容为空，请先发送文本或图片")
-                    controller.keep(timeout=timeout, reset_timeout=True)
-                    return
+        yield event.plain_result(
+            f"--- 投稿预览 ---\n{preview}{img_hint}\n\n确认发布请发送 /确认，取消请发送 /取消"
+        )
 
-                preview = contrib.merged_text or "(无文字)"
-                await _send_text(event, f"--- 投稿预览 ---\n{preview}")
+    @filter.command("确认")
+    async def cmd_confirm(self, event: AstrMessageEvent):
+        """确认发布投稿"""
+        session_id = event.unified_msg_origin
+        if session_id not in self.contrib_sessions:
+            yield event.plain_result("当前没有进行中的投稿。")
+            return
 
-                for img_url in contrib.images:
-                    await event.send(event.image_result(img_url))
+        contrib = self.contrib_sessions[session_id]
+        if not contrib.awaiting_confirm:
+            yield event.plain_result("请先发送 /完成 进行预览。")
+            return
 
-                n_img = len(contrib.images)
-                img_hint = f"共 {n_img} 张图片\n" if n_img else ""
-                await _send_text(
-                    event,
-                    f"{img_hint}确认发布请发送「确认」，取消请发送「取消」",
-                )
-                awaiting_confirm = True
-                controller.keep(timeout=60, reset_timeout=True)
-                return
+        yield event.plain_result("正在发布到QQ空间...")
+        result_msg = await self._do_publish(event, contrib)
+        del self.contrib_sessions[session_id]
+        yield event.plain_result(result_msg)
 
-            # --- 确认/取消发布 ---
-            if awaiting_confirm:
-                if text in ("确认", "是", "发布"):
-                    await self._publish_contribution(event, contrib)
-                    controller.stop()
-                    return
-                elif text in ("取消", "否"):
-                    await _send_text(event, "已取消发布")
-                    controller.stop()
-                    return
-                else:
-                    await _send_text(event, "请发送「确认」或「取消」")
-                    controller.keep(timeout=60, reset_timeout=True)
-                    return
+    @filter.command("取消")
+    async def cmd_cancel(self, event: AstrMessageEvent):
+        """取消当前投稿"""
+        session_id = event.unified_msg_origin
+        if session_id not in self.contrib_sessions:
+            yield event.plain_result("当前没有进行中的投稿。")
+            return
 
-            # --- 未知命令兜底：取消当前投稿并重新分发 ---
-            if raw_text.startswith("/"):
-                await _send_text(event, "当前投稿已取消，正在处理新命令...")
-                controller.stop()
-                new_event = copy.copy(event)
-                self.context.get_event_queue().put_nowait(new_event)
-                return
+        del self.contrib_sessions[session_id]
+        yield event.plain_result("已取消投稿。")
 
-            # --- 收集文本和图片 ---
-            if text:
-                contrib.texts.append(text)
-            images = get_image_urls(event)
-            contrib.images.extend(images)
-            controller.keep(timeout=timeout, reset_timeout=True)
+    # ── 全局消息监听：收集投稿内容 ────────────────────────────
 
-        try:
-            await waiter(event, session_filter=SchoolZoneSessionFilter())
-        except TimeoutError:
-            yield event.plain_result("投稿超时，已取消")
-        finally:
-            event.stop_event()
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_contribute_message(self, event: AstrMessageEvent):
+        """在投稿进行中时收集用户发送的文本和图片"""
+        session_id = event.unified_msg_origin
+        if session_id not in self.contrib_sessions:
+            return
+
+        contrib = self.contrib_sessions[session_id]
+
+        # 等待确认阶段，忽略非命令消息
+        if contrib.awaiting_confirm:
+            return
+
+        text = event.message_str.strip()
+        images = get_image_urls(event)
+
+        if not text and not images:
+            return
+
+        if text:
+            contrib.texts.append(text)
+        contrib.images.extend(images)
+
+        parts = []
+        if text:
+            parts.append("文本")
+        if images:
+            parts.append(f"{len(images)} 张图片")
+        yield event.plain_result(
+            f"已收到{'、'.join(parts)}。继续发送或输入 /完成"
+        )
+        event.stop_event()
 
     # ── LLM Tool ─────────────────────────────────────────────
 
